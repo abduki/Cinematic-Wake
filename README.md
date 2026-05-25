@@ -67,6 +67,13 @@ python cinematic_wake.py
 
 ---
 
+4. additionaly if you prefer an exe with everything ready to go you can compile it like this
+```bash
+pyinstaller --noconsole --onefile 'C:\Users\Desktop\Downloads\cinematic_wake3.py'
+
+```
+
+
 ## ⚙️ Configuration
 
 CinematicWake generates a configuration file at `~/.cinematic_wake.json` upon first run. You can edit this file directly or via the planned UI.
@@ -98,4 +105,3 @@ CinematicWake generates a configuration file at `~/.cinematic_wake.json` upon fi
 * **Force Sleep:** `Win + Alt + L` (Customizable via `hotkey_sleep` and `hotkey_mods`)
 * **Pause/Resume App:** `Win + Alt + P` (Customizable via `hotkey_pause` and `hotkey_mods`)
 
-```
