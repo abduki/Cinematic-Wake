@@ -17,9 +17,38 @@ import datetime
 import subprocess
 from pathlib import Path
 
+
 import pystray
 from PIL import Image, ImageDraw
 
+try:
+    from winsdk.windows.media.control import GlobalSystemMediaTransportControlsSessionManager
+    WINSDK_AVAILABLE = True
+except ImportError:
+    WINSDK_AVAILABLE = False
+    print("winsdk not installed. Universal media detection disabled.")
+
+def _check_windows_media_api() -> bool:
+
+    if not WINSDK_AVAILABLE:
+        return False
+
+    async def _get_playing_status():
+        try:
+            manager = await GlobalSystemMediaTransportControlsSessionManager.request_async()
+            session = manager.get_current_session()
+            if session:
+                playback_info = session.get_playback_info()
+                if playback_info and playback_info.playback_status == 4:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    try:
+        return asyncio.run(_get_playing_status())
+    except Exception:
+        return False
 
 user32   = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -45,9 +74,12 @@ def get_idle_tick() -> int:
 
 
 def is_media_playing() -> bool:
-    return (_check_audio_sessions()
-            or _check_window_titles()
-            or _check_powercfg())
+    return (
+        _check_windows_media_api()
+        or _check_audio_sessions()
+        or _check_window_titles()
+        or _check_powercfg()
+    )
 
 
 _AUDIO_PROCESS_NAMES = {
