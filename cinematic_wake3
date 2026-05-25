@@ -1,0 +1,1991 @@
+import ctypes
+import ctypes.wintypes as wintypes
+import json
+import math
+import os
+import sys
+import threading
+import time
+import tkinter as tk
+import tkinter.ttk as ttk
+import tkinter.colorchooser as colorchooser
+import winreg
+import winsound
+import wave
+import struct
+import datetime
+import subprocess
+from pathlib import Path
+
+import pystray
+from PIL import Image, ImageDraw
+
+
+user32   = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+shell32  = ctypes.windll.shell32
+
+
+class LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+
+def get_idle_seconds() -> float:
+    lii = LASTINPUTINFO()
+    lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+    user32.GetLastInputInfo(ctypes.byref(lii))
+    return (kernel32.GetTickCount() - lii.dwTime) / 1000.0
+
+
+def get_idle_tick() -> int:
+    lii = LASTINPUTINFO()
+    lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+    user32.GetLastInputInfo(ctypes.byref(lii))
+    return lii.dwTime
+
+
+def is_media_playing() -> bool:
+    return (_check_audio_sessions()
+            or _check_window_titles()
+            or _check_powercfg())
+
+
+_AUDIO_PROCESS_NAMES = {
+    "brave.exe", "chrome.exe", "msedge.exe", "firefox.exe",
+    "opera.exe", "operagx.exe", "vivaldi.exe", "iexplore.exe",
+    "vlc.exe", "mpc-hc.exe", "mpc-hc64.exe", "mpc-be.exe", "mpc-be64.exe",
+    "spotify.exe", "foobar2000.exe", "winamp.exe", "aimp.exe",
+    "itunes.exe", "musicbee.exe", "potplayer.exe", "potplayermini.exe",
+    "potplayermini64.exe", "mpv.exe", "mplayer.exe",
+    "wmplayer.exe", "groove.exe", "movies.exe",
+}
+
+_CLSID_MMDeviceEnumerator  = "{BCDE0395-E52F-467C-8E3D-C4579291692E}"
+_IID_IMMDeviceEnumerator   = "{A95664D2-9614-4F35-A746-DE8DB63617E6}"
+_IID_IAudioSessionManager2 = "{77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F}"
+_IID_IAudioSessionEnumerator  = "{E2F5BB11-0570-40CA-ACDD-3AA01277DEE8}"
+_IID_IAudioSessionControl2    = "{BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D}"
+
+
+def _check_audio_sessions() -> bool:
+    return _check_audio_via_ps()
+
+
+def _check_audio_via_ps() -> bool:
+    ps_script = r"""
+try {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+[Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IMMDeviceEnumerator {
+    int NotImpl1();
+    [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice ppDevice);
+}
+
+[Guid("D666063F-1587-4E43-81F1-B948E807363F")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IMMDevice {
+    int NotImpl1();
+    int NotImpl2();
+    [PreserveSig] int Activate(ref Guid iid, int clsCtx, IntPtr activationParams, out IAudioSessionManager2 ppInterface);
+}
+
+[Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IAudioSessionManager2 {
+    int NotImpl1();
+    int NotImpl2();
+    [PreserveSig] int GetSessionEnumerator(out IAudioSessionEnumerator sessionEnum);
+}
+
+[Guid("E2F5BB11-0570-40CA-ACDD-3AA01277DEE8")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IAudioSessionEnumerator {
+    [PreserveSig] int GetCount(out int sessionCount);
+    [PreserveSig] int GetSession(int sessionIndex, out IAudioSessionControl session);
+}
+
+[Guid("F4B1A599-7266-4319-A8CA-E70ACB11E8CD")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IAudioSessionControl {
+    [PreserveSig] int GetState(out int state);
+}
+
+[Guid("BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IAudioSessionControl2 : IAudioSessionControl {
+    [PreserveSig] int GetDisplayName(out string displayName);
+    [PreserveSig] int SetDisplayName(string displayName, ref Guid eventContext);
+    [PreserveSig] int GetIconPath(out string iconPath);
+    [PreserveSig] int SetIconPath(string iconPath, ref Guid eventContext);
+    [PreserveSig] int GetGroupingParam(out Guid groupingParam);
+    [PreserveSig] int SetGroupingParam(ref Guid groupingParam, ref Guid eventContext);
+    [PreserveSig] int RegisterAudioSessionNotification(IntPtr client);
+    [PreserveSig] int UnregisterAudioSessionNotification(IntPtr client);
+    [PreserveSig] int GetSessionIdentifier(out string retVal);
+    [PreserveSig] int GetSessionInstanceIdentifier(out string retVal);
+    [PreserveSig] int GetProcessId(out uint retVal);
+    [PreserveSig] int IsSystemSoundsSession();
+    [PreserveSig] int SetDuckingPreference(bool optOut);
+}
+"@ -ErrorAction Stop
+
+    $type = [Type]::GetTypeFromCLSID([Guid]"BCDE0395-E52F-467C-8E3D-C4579291692E")
+    $enumerator = [Activator]::CreateInstance($type)
+    $device = $null
+    $enumerator.GetDefaultAudioEndpoint(0, 1, [ref]$device) | Out-Null
+
+    $mgr2Guid = [Guid]"77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F"
+    $manager = $null
+    $device.Activate([ref]$mgr2Guid, 23, [IntPtr]::Zero, [ref]$manager) | Out-Null
+
+    $sessionEnum = $null
+    $manager.GetSessionEnumerator([ref]$sessionEnum) | Out-Null
+
+    $count = 0
+    $sessionEnum.GetCount([ref]$count) | Out-Null
+
+    $mediaNames = @('brave','chrome','msedge','firefox','opera','vivaldi',
+                    'vlc','mpc-hc','mpc-be','spotify','foobar2000','winamp',
+                    'aimp','itunes','musicbee','potplayer','mpv','wmplayer',
+                    'groove','movies')
+
+    for ($i = 0; $i -lt $count; $i++) {
+        $session = $null
+        $sessionEnum.GetSession($i, [ref]$session) | Out-Null
+        $ctrl2 = $session -as [IAudioSessionControl2]
+        if ($ctrl2 -ne $null) {
+            $state = 0
+            $ctrl2.GetState([ref]$state) | Out-Null
+            if ($state -eq 1) {
+                $pid = 0
+                $ctrl2.GetProcessId([ref]$pid) | Out-Null
+                if ($pid -gt 0) {
+                    $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+                    if ($proc) {
+                        $name = $proc.Name.ToLower()
+                        foreach ($m in $mediaNames) {
+                            if ($name -like "*$m*") {
+                                Write-Output "ACTIVE:$($proc.Name)"
+                                exit 0
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Write-Output "NONE"
+} catch {
+    Write-Output "ERROR:$($_.Exception.Message)"
+}
+"""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-WindowStyle", "Hidden", "-Command", ps_script],
+            capture_output=True, text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            timeout=8
+        )
+        return result.stdout.strip().startswith("ACTIVE:")
+    except Exception:
+        return False
+
+
+_MEDIA_PROCESS_NAMES = {
+    "brave", "chrome", "msedge", "firefox", "opera", "operagx",
+    "vivaldi", "iexplore",
+    "vlc", "mpc-hc", "mpc-hc64", "mpc-be", "mpc-be64",
+    "spotify", "foobar2000", "winamp", "aimp", "itunes",
+    "musicbee", "potplayer", "potplayermini", "potplayermini64",
+    "mpv", "mplayer", "wmplayer", "groove", "movies",
+}
+
+_MEDIA_TITLE_KEYWORDS = [
+    "youtube", "netflix", "twitch", "hulu", "disney+", "disneyplus",
+    "prime video", "amazon video", "hbo max", "max ", "peacock",
+    "paramount+", "apple tv", "crunchyroll", "funimation", "plex",
+    "jellyfin", "emby", "tidal", "deezer", "soundcloud", "bandcamp",
+    "vimeo", "dailymotion", "rumble",
+    "▶", "⏸", "▷",
+    " - vlc", "- vlc media player",
+    " - mpc", "media player classic",
+    "- mpv",
+    "- foobar2000", "- winamp", "- aimp",
+    "- windows media player",
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
+    ".mp3", ".flac", ".aac", ".ogg", ".wav",
+]
+
+
+def _enum_windows_titles() -> list[tuple[str, str]]:
+    results = []
+    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, ctypes.c_long)
+
+    def _callback(hwnd, _):
+        try:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length == 0:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = buf.value.strip().lower()
+            if not title:
+                return True
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            PROCESS_QUERY_LIMITED = 0x1000
+            h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED, False, pid.value)
+            if h:
+                buf2 = ctypes.create_unicode_buffer(260)
+                size = wintypes.DWORD(260)
+                kernel32.QueryFullProcessImageNameW(h, 0, buf2, ctypes.byref(size))
+                kernel32.CloseHandle(h)
+                proc_name = Path(buf2.value).stem.lower()
+                if proc_name in _MEDIA_PROCESS_NAMES:
+                    results.append((proc_name, title))
+        except Exception:
+            pass
+        return True
+
+    user32.EnumWindows(EnumWindowsProc(_callback), 0)
+    return results
+
+
+def _check_window_titles() -> bool:
+    try:
+        windows = _enum_windows_titles()
+        for proc_name, title in windows:
+            for kw in _MEDIA_TITLE_KEYWORDS:
+                if kw in title:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _check_powercfg() -> bool:
+    try:
+        output = subprocess.check_output(
+            ["powercfg", "/requests"],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            text=True, encoding='utf-8', errors='ignore',
+            timeout=5
+        )
+        output_lower = output.lower()
+
+        target_apps = [
+            "vlc.exe", "mpc-hc", "mpc-be", "spotify.exe",
+            "wmplayer.exe", "groove.exe", "movies.exe",
+            "potplayer", "foobar2000", "winamp.exe",
+        ]
+        for app in target_apps:
+            if app in output_lower:
+                return True
+
+        in_lock_section = False
+        for line in output_lower.splitlines():
+            line = line.strip()
+            if any(line.startswith(h) for h in
+                   ("display:", "system:", "anzeige:", "affichage:",
+                    "système:", "sistema:", "bildschirm:")):
+                in_lock_section = True
+                continue
+            if in_lock_section:
+                if line == "" or (line.endswith(":") and len(line) < 30):
+                    in_lock_section = False
+                    continue
+                if "[" in line:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+SC_MONITORPOWER = 0xF170
+WM_SYSCOMMAND   = 0x0112
+MONITOR_OFF     = 2
+HWND_BROADCAST  = wintypes.HWND(0xFFFF)
+
+
+def send_monitor_off():
+    def _send():
+        user32.SendMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, MONITOR_OFF)
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def keep_app_alive():
+    kernel32.SetThreadExecutionState(0x80000000 | 0x00000001 | 0x00000002)
+
+
+MOD_NOREPEAT = 0x4000
+WM_HOTKEY    = 0x0312
+
+
+CONFIG_PATH = Path.home() / ".cinematic_wake.json"
+STATS_PATH  = Path.home() / ".cinematic_wake_stats.json"
+
+DEFAULT_CONFIG = {
+    "idle_minutes":              5,
+    "prevent_sleep_media":       True,
+    "fade_in_ms":                1000,
+    "fade_out_ms":               1500,
+    "wake_delay_s":              3.0,
+    "overlay_color":             "#000000",
+    "overlay_theme":             "black",
+    "ambient_mode":              False,
+    "ambient_min_alpha":         0.85,
+    "ambient_speed_s":           8.0,
+    "ambient_schedule_enabled":  False,
+    "ambient_schedule_start":    "22:00",
+    "ambient_schedule_end":      "07:00",
+    "ambient_idle_enabled":      False,
+    "ambient_idle_minutes":      2,
+    "ambient_escalate_minutes":  10,
+    "ambient_escalate_action":   "sleep",
+    "fade_curve":                "ease_in_out",
+    "schedule_enabled":          False,
+    "schedule_start":            "08:00",
+    "schedule_end":              "23:00",
+    "sound_enabled":             False,
+    "sound_sleep_freq":          300,
+    "sound_wake_freq":           600,
+    "sound_duration_ms":         400,
+    "hotkey_sleep":              0x4C,
+    "hotkey_pause":              0x50,
+    "hotkey_mods":               0x0006,
+    "start_with_windows":        False,
+    "start_in_tray":             True,
+    "show_countdown":            True,
+    "countdown_seconds":         5,
+}
+
+THEME_COLORS = {
+    "black": "#000000",
+    "red":   "#0D0000",
+    "blue":  "#00000D",
+    "green": "#000D00",
+}
+
+CURVES = [
+    ("Linear",      "linear"),
+    ("Ease In",     "ease_in"),
+    ("Ease Out",    "ease_out"),
+    ("Ease In-Out", "ease_in_out"),
+    ("Sine",        "sine"),
+]
+
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH) as f:
+                return {**DEFAULT_CONFIG, **json.load(f)}
+        except Exception:
+            pass
+    return dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg: dict):
+    _atomic_json_write(CONFIG_PATH, cfg)
+
+
+def _atomic_json_write(path: Path, data: dict):
+    tmp = path.with_suffix(".tmp")
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        tmp.replace(path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def load_stats() -> dict:
+    if STATS_PATH.exists():
+        try:
+            with open(STATS_PATH) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"total_sleeps": 0, "total_off_seconds": 0, "last_sleep": None}
+
+
+def save_stats(stats: dict):
+    _atomic_json_write(STATS_PATH, stats)
+
+
+def _gen_tone(freq: int, duration_ms: int, volume=0.3, fade_ms=80) -> bytes:
+    rate   = 44100
+    n      = int(rate * duration_ms / 1000)
+    if n == 0:
+        return b""
+    fade_n = min(int(rate * fade_ms / 1000), n // 2)
+    out = []
+    for i in range(n):
+        if fade_n > 0 and i < fade_n:
+            env = i / fade_n
+        elif fade_n > 0 and i >= n - fade_n:
+            env = (n - i) / fade_n
+        else:
+            env = 1.0
+        s = int(32767 * volume * env * math.sin(2 * math.pi * freq * i / rate))
+        out.append(struct.pack("<h", max(-32767, min(32767, s))))
+    return b"".join(out)
+
+
+def play_tone(freq: int, duration_ms: int):
+    def _play():
+        try:
+            tmp = Path(os.environ.get("TEMP", ".")) / "_cw_tone.wav"
+            with wave.open(str(tmp), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(44100)
+                wf.writeframes(_gen_tone(freq, duration_ms))
+            winsound.PlaySound(str(tmp), winsound.SND_FILENAME | winsound.SND_NODEFAULT)
+        except Exception:
+            pass
+    threading.Thread(target=_play, daemon=True).start()
+
+
+def ease(t: float, curve: str) -> float:
+    t = max(0.0, min(1.0, t))
+    if curve == "linear":      return t
+    if curve == "ease_in":     return t * t
+    if curve == "ease_out":    return 1 - (1 - t) ** 2
+    if curve == "ease_in_out": return t * t * (3 - 2 * t)
+    if curve == "sine":        return (1 - math.cos(t * math.pi)) / 2
+    return t
+
+
+def get_monitor_rects() -> list:
+    rects = []
+    MonitorEnumProc = ctypes.WINFUNCTYPE(
+        ctypes.c_bool, ctypes.c_ulong, ctypes.c_ulong,
+        ctypes.POINTER(wintypes.RECT), ctypes.c_double)
+
+    def _cb(hMon, hdcMon, lprc, dw):
+        r = lprc.contents
+        rects.append((r.left, r.top, r.right - r.left, r.bottom - r.top))
+        return True
+
+    user32.EnumDisplayMonitors(None, None, MonitorEnumProc(_cb), 0)
+    if not rects:
+        rects = [(user32.GetSystemMetrics(76), user32.GetSystemMetrics(77),
+                  user32.GetSystemMetrics(78), user32.GetSystemMetrics(79))]
+    return rects
+
+
+APP_NAME = "CinematicWake"
+REG_RUN  = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def set_autostart(enabled: bool):
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_RUN, 0, winreg.KEY_SET_VALUE)
+        if enabled:
+            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ,
+                              f'"{sys.executable}" "{os.path.abspath(__file__)}"')
+        else:
+            try:
+                winreg.DeleteValue(key, APP_NAME)
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+
+
+def get_autostart() -> bool:
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_RUN, 0, winreg.KEY_READ)
+        winreg.QueryValueEx(key, APP_NAME)
+        winreg.CloseKey(key)
+        return True
+    except Exception:
+        return False
+
+
+def _parse_time(s: str):
+    h, m = map(int, s.split(":"))
+    return datetime.time(h, m)
+
+
+def _in_window(start_str: str, end_str: str) -> bool:
+    now = datetime.datetime.now().time()
+    try:
+        start = _parse_time(start_str)
+        end   = _parse_time(end_str)
+        if start == end:
+            return True
+        if start < end:
+            return start <= now <= end
+        return now >= start or now <= end
+    except Exception:
+        return False
+
+
+def within_schedule(cfg: dict) -> bool:
+    if not cfg.get("schedule_enabled"):
+        return True
+    return _in_window(cfg["schedule_start"], cfg["schedule_end"])
+
+
+def within_ambient_schedule(cfg: dict) -> bool:
+    if not cfg.get("ambient_schedule_enabled"):
+        return False
+    return _in_window(cfg["ambient_schedule_start"], cfg["ambient_schedule_end"])
+
+
+class Overlay:
+    def __init__(self, root: tk.Tk):
+        self.root             = root
+        self._windows: list[tk.Toplevel] = []
+        self._canvases: list[tk.Canvas]  = []
+        self._alpha           = 0.0
+        self._ambient_job     = None
+        self._anim_job        = None
+        self._last_monitor_rects: list = []
+        self._build()
+        self.root.after(10000, self._check_monitors)
+
+    def _check_monitors(self):
+        try:
+            current = get_monitor_rects()
+            if current != self._last_monitor_rects:
+                saved_alpha = self._alpha
+                self._build()
+                if saved_alpha > 0:
+                    self._set_alpha(saved_alpha)
+                    for w in self._windows:
+                        w.deiconify()
+                        w.lift()
+        except Exception:
+            pass
+        self.root.after(10000, self._check_monitors)
+
+    def _build(self):
+        for w in self._windows:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._windows.clear()
+        self._canvases.clear()
+        rects = get_monitor_rects()
+        self._last_monitor_rects = rects
+        for (x, y, w, h) in rects:
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            win.wm_attributes("-topmost", True)
+            win.wm_attributes("-alpha",   0.0)
+            win.geometry(f"{w}x{h}+{x}+{y}")
+            canvas = tk.Canvas(win, width=w, height=h, bg="black", highlightthickness=0)
+            canvas.pack(fill="both", expand=True)
+            win.withdraw()
+            self._windows.append(win)
+            self._canvases.append(canvas)
+
+    def set_color(self, hex_color: str):
+        for c in self._canvases:
+            c.configure(bg=hex_color)
+
+    def show_countdown(self, seconds: int):
+        self._clear_text()
+        for c in self._canvases:
+            w, h = c.winfo_width() or 1920, c.winfo_height() or 1080
+            c.create_text(w // 2, h // 2, text=str(seconds),
+                          font=("Helvetica", 96, "bold"),
+                          fill="#1a1a1a", tags="countdown")
+
+    def _clear_text(self):
+        for c in self._canvases:
+            c.delete("countdown")
+
+    def _set_alpha(self, a: float):
+        self._alpha = max(0.0, min(1.0, a))
+        for w in self._windows:
+            try:
+                w.wm_attributes("-alpha", self._alpha)
+            except Exception:
+                pass
+
+    def _cancel_anim(self):
+        if self._anim_job:
+            try:
+                self.root.after_cancel(self._anim_job)
+            except Exception:
+                pass
+            self._anim_job = None
+
+    def _cancel_ambient(self):
+        if self._ambient_job:
+            try:
+                self.root.after_cancel(self._ambient_job)
+            except Exception:
+                pass
+            self._ambient_job = None
+
+    def show_instant(self, alpha=1.0):
+        self._cancel_anim()
+        self._cancel_ambient()
+        self._set_alpha(alpha)
+        for w in self._windows:
+            w.deiconify()
+            w.lift()
+        self.root.update()
+
+    def hide_instant(self):
+        self._cancel_anim()
+        self._cancel_ambient()
+        for w in self._windows:
+            w.withdraw()
+        self._alpha = 0.0
+
+    def fade_to(self, target: float, duration_ms: int,
+                curve: str = "ease_in_out", callback=None):
+        self._cancel_anim()
+        if duration_ms <= 0:
+            if target > 0:
+                self.show_instant(target)
+            else:
+                self.hide_instant()
+            if callback:
+                callback()
+            return
+
+        start_alpha = self._alpha
+        delta       = target - start_alpha
+        steps       = max(20, duration_ms // 16)
+        interval    = max(1,  duration_ms // steps)
+        t0          = time.perf_counter()
+
+        if target > 0 and start_alpha == 0:
+            for w in self._windows:
+                w.deiconify()
+                w.lift()
+
+        def _step():
+            t = min((time.perf_counter() - t0) * 1000 / duration_ms, 1.0)
+            self._set_alpha(start_alpha + delta * ease(t, curve))
+            if t < 1.0:
+                self._anim_job = self.root.after(interval, _step)
+            else:
+                self._set_alpha(target)
+                if target == 0:
+                    for w in self._windows:
+                        w.withdraw()
+                if callback:
+                    callback()
+        _step()
+
+    def start_ambient(self, min_alpha: float, cycle_s: float):
+        self._cancel_ambient()
+        t0 = time.perf_counter()
+
+        def _pulse():
+            t     = (time.perf_counter() - t0) % cycle_s / cycle_s
+            alpha = min_alpha + (1.0 - min_alpha) * (0.5 - 0.5 * math.cos(2 * math.pi * t))
+            self._set_alpha(alpha)
+            self._ambient_job = self.root.after(33, _pulse)
+        _pulse()
+
+    def stop_ambient(self):
+        self._cancel_ambient()
+
+    def destroy(self):
+        self._cancel_anim()
+        self._cancel_ambient()
+        for w in self._windows:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+
+class State:
+    IDLE       = "idle"
+    COUNTDOWN  = "countdown"
+    FADING_OUT = "fading_out"
+    AMBIENT    = "ambient"
+    SLEEPING   = "sleeping"
+    WAKING     = "waking"
+    FADING_IN  = "fading_in"
+    PAUSED     = "paused"
+    CANCELING  = "canceling"
+
+
+class CinematicWake:
+    def __init__(self, overlay: Overlay, cfg: dict):
+        self.overlay   = overlay
+        self.cfg       = cfg
+        self.state     = State.IDLE
+        self.stats     = load_stats()
+        self._lock     = threading.Lock()
+        self._stats_lock = threading.Lock()
+
+        self._sleep_start             = 0.0
+        self._ambient_start           = 0.0
+        self._idle_tick_at_sleep      = 0
+        self._idle_tick_at_fade_start = 0
+        self._countdown_val           = 0
+        self._tray: "SystemTray | None" = None
+
+        self._last_media_check_time  = 0.0
+        self._media_is_playing       = False
+        self._last_media_active_time = time.time()
+        self._media_check_running    = False
+
+        self._registered_hk_mods  = None
+        self._registered_hk_sleep = None
+        self._registered_hk_pause = None
+
+    def start(self):
+        keep_app_alive()
+        threading.Thread(target=self._monitor_loop, daemon=True).start()
+        threading.Thread(target=self._hotkey_loop,  daemon=True).start()
+
+    def _monitor_loop(self):
+        _keep_alive_counter = 0
+        while True:
+            time.sleep(0.5)
+            with self._lock:
+                state = self.state
+                cfg   = dict(self.cfg)
+
+            now           = time.time()
+            prevent_media = cfg.get("prevent_sleep_media", True)
+
+            _keep_alive_counter += 1
+            if _keep_alive_counter >= 120:
+                keep_app_alive()
+                _keep_alive_counter = 0
+
+            if prevent_media and state in (State.IDLE, State.AMBIENT, State.COUNTDOWN):
+                if (not self._media_check_running
+                        and now - self._last_media_check_time > 5.0):
+                    self._media_check_running = True
+                    def _do_check():
+                        try:
+                            result = is_media_playing()
+                            self._media_is_playing = result
+                            self._last_media_check_time = time.time()
+                        finally:
+                            self._media_check_running = False
+                    threading.Thread(target=_do_check, daemon=True).start()
+                if self._media_is_playing:
+                    self._last_media_active_time = now
+
+            if state == State.IDLE:
+                if not within_schedule(cfg):
+                    continue
+
+                raw_idle = get_idle_seconds()
+                if prevent_media:
+                    idle_since_media = now - self._last_media_active_time
+                    idle = min(raw_idle, idle_since_media)
+                else:
+                    idle = raw_idle
+
+                thresh = cfg["idle_minutes"] * 60
+
+                if within_ambient_schedule(cfg):
+                    self._enter_ambient()
+                    continue
+
+                if cfg.get("ambient_idle_enabled"):
+                    amb_thresh = cfg.get("ambient_idle_minutes", 2) * 60
+                    if idle >= amb_thresh:
+                        self._enter_ambient()
+                        continue
+
+                if cfg.get("show_countdown") and cfg.get("countdown_seconds", 0) > 0:
+                    cd = cfg["countdown_seconds"]
+                    if thresh - cd <= idle < thresh:
+                        remaining = max(1, int(thresh - idle))
+                        if remaining != self._countdown_val:
+                            self._countdown_val = remaining
+                            with self._lock:
+                                if self.state == State.IDLE:
+                                    self.state = State.COUNTDOWN
+                            self.overlay.root.after(0, lambda r=remaining: self.overlay.show_countdown(r))
+                            if self.overlay._alpha < 0.05:
+                                self.overlay.root.after(0, lambda: self.overlay.show_instant(0.04))
+                    elif idle < thresh - cd and self._countdown_val != 0:
+                        self._countdown_val = 0
+                        with self._lock:
+                            if self.state == State.COUNTDOWN:
+                                self.state = State.IDLE
+                        self.overlay.root.after(0, self.overlay._clear_text)
+                        if 0 < self.overlay._alpha < 0.1:
+                            self.overlay.root.after(0, self.overlay.hide_instant)
+
+                if idle >= thresh:
+                    self._countdown_val = 0
+                    self.overlay.root.after(0, self.overlay._clear_text)
+                    if cfg.get("ambient_mode"):
+                        self._enter_ambient()
+                    else:
+                        self._go_to_sleep()
+
+            elif state == State.COUNTDOWN:
+                if not within_schedule(cfg):
+                    with self._lock:
+                        if self.state == State.COUNTDOWN:
+                            self.state = State.IDLE
+                    self._countdown_val = 0
+                    self.overlay.root.after(0, self.overlay._clear_text)
+                    continue
+
+                raw_idle = get_idle_seconds()
+                if prevent_media:
+                    idle = min(raw_idle, now - self._last_media_active_time)
+                else:
+                    idle = raw_idle
+                thresh = cfg["idle_minutes"] * 60
+
+                if idle >= thresh:
+                    self._countdown_val = 0
+                    self.overlay.root.after(0, self.overlay._clear_text)
+                    if cfg.get("ambient_mode"):
+                        self._enter_ambient()
+                    else:
+                        self._go_to_sleep()
+                elif idle < thresh - cfg.get("countdown_seconds", 5):
+                    with self._lock:
+                        if self.state == State.COUNTDOWN:
+                            self.state = State.IDLE
+                    self._countdown_val = 0
+                    self.overlay.root.after(0, self.overlay._clear_text)
+                    if 0 < self.overlay._alpha < 0.1:
+                        self.overlay.root.after(0, self.overlay.hide_instant)
+
+            elif state == State.AMBIENT:
+                if get_idle_tick() != self._idle_tick_at_sleep:
+                    self._leave_ambient()
+                    continue
+
+                if prevent_media and self._media_is_playing:
+                    self._leave_ambient()
+                    continue
+
+                raw_idle = get_idle_seconds()
+                if prevent_media:
+                    idle = min(raw_idle, now - self._last_media_active_time)
+                else:
+                    idle = raw_idle
+
+                if cfg.get("ambient_schedule_enabled") and not within_ambient_schedule(cfg):
+                    self._escalate_ambient(cfg)
+                    continue
+
+                if cfg.get("ambient_idle_enabled"):
+                    elapsed_amb = time.time() - self._ambient_start
+                    if elapsed_amb >= cfg.get("ambient_escalate_minutes", 10) * 60:
+                        self._escalate_ambient(cfg)
+                        continue
+
+            elif state == State.SLEEPING:
+                if get_idle_tick() != self._idle_tick_at_sleep:
+                    self._begin_wake()
+
+            elif state == State.FADING_OUT:
+                if get_idle_tick() != self._idle_tick_at_fade_start:
+                    self._cancel_sleep()
+
+    def _hotkey_loop(self):
+        msg = wintypes.MSG()
+        while True:
+            with self._lock:
+                mods     = self.cfg.get("hotkey_mods",  0x0006)
+                hk_sleep = self.cfg.get("hotkey_sleep", 0x4C)
+                hk_pause = self.cfg.get("hotkey_pause", 0x50)
+
+            if (mods     != self._registered_hk_mods  or
+                hk_sleep != self._registered_hk_sleep or
+                hk_pause != self._registered_hk_pause):
+                if self._registered_hk_mods is not None:
+                    user32.UnregisterHotKey(None, 1)
+                    user32.UnregisterHotKey(None, 2)
+                user32.RegisterHotKey(None, 1, mods | MOD_NOREPEAT, hk_sleep)
+                user32.RegisterHotKey(None, 2, mods | MOD_NOREPEAT, hk_pause)
+                self._registered_hk_mods  = mods
+                self._registered_hk_sleep = hk_sleep
+                self._registered_hk_pause = hk_pause
+
+            if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                if msg.message == WM_HOTKEY:
+                    if msg.wParam == 1:
+                        self.overlay.root.after(0, self._hotkey_sleep)
+                    elif msg.wParam == 2:
+                        self.overlay.root.after(0, self._hotkey_pause)
+            time.sleep(0.05)
+
+    def _hotkey_sleep(self):
+        self.force_sleep()
+
+    def _hotkey_pause(self):
+        with self._lock:
+            if self.state == State.PAUSED:
+                self.state = State.IDLE
+            elif self.state == State.IDLE:
+                self.state = State.PAUSED
+            else:
+                return
+        self.overlay.root.after(0, lambda: self.overlay.root.event_generate("<<PauseChanged>>", when="tail"))
+
+    def _enter_ambient(self):
+        with self._lock:
+            if self.state not in (State.IDLE, State.COUNTDOWN, State.PAUSED):
+                return
+            self.state               = State.AMBIENT
+            self._idle_tick_at_sleep = get_idle_tick()
+            self._ambient_start      = time.time()
+        cfg = dict(self.cfg)
+        self.overlay.root.after(0, lambda: self._gui_enter_ambient(cfg))
+
+    def _gui_enter_ambient(self, cfg: dict):
+        self.overlay.set_color(cfg.get("overlay_color", "#000000"))
+        self.overlay._clear_text()
+        min_a = cfg.get("ambient_min_alpha", 0.85)
+        dur   = cfg.get("fade_out_ms", 1500)
+        curve = cfg.get("fade_curve", "ease_in_out")
+
+        def _on_ready():
+            with self._lock:
+                if self.state != State.AMBIENT:
+                    return
+            self.overlay.start_ambient(min_a, cfg.get("ambient_speed_s", 8.0))
+            self.overlay.root.event_generate("<<StateChanged>>", when="tail")
+
+        self.overlay.fade_to(min_a, dur, curve, callback=_on_ready)
+        self.overlay.root.event_generate("<<StateChanged>>", when="tail")
+
+    def _leave_ambient(self):
+        with self._lock:
+            if self.state != State.AMBIENT:
+                return
+            self.state = State.CANCELING
+        cfg = dict(self.cfg)
+        self.overlay.root.after(0, lambda: self._gui_leave_ambient(cfg))
+
+    def _gui_leave_ambient(self, cfg: dict):
+        self.overlay.stop_ambient()
+        dur   = cfg.get("fade_in_ms", 1000)
+        curve = cfg.get("fade_curve", "ease_in_out")
+
+        def _on_clear():
+            with self._lock:
+                self.state = State.IDLE
+            self.overlay.root.event_generate("<<StateChanged>>", when="tail")
+
+        self.overlay.fade_to(0.0, dur, curve, callback=_on_clear)
+        self.overlay.root.event_generate("<<StateChanged>>", when="tail")
+
+    def _escalate_ambient(self, cfg: dict):
+        with self._lock:
+            if self.state != State.AMBIENT:
+                return
+            self.state = State.IDLE
+        action = cfg.get("ambient_escalate_action", "sleep")
+        self.overlay.root.after(0, self.overlay.stop_ambient)
+        if action == "sleep":
+            self._go_to_sleep()
+        else:
+            self.overlay.root.after(0, lambda: self._gui_leave_ambient(cfg))
+
+    def _go_to_sleep(self):
+        with self._lock:
+            if self.state not in (State.IDLE, State.COUNTDOWN, State.PAUSED):
+                return
+            self.state                    = State.FADING_OUT
+            self._idle_tick_at_sleep      = get_idle_tick()
+            self._idle_tick_at_fade_start = get_idle_tick()
+            self._sleep_start             = time.time()
+        cfg = dict(self.cfg)
+        if cfg.get("sound_enabled"):
+            play_tone(cfg["sound_sleep_freq"], cfg["sound_duration_ms"])
+        self.overlay.root.after(0, lambda: self._gui_fade_to_sleep(cfg))
+
+    def _cancel_sleep(self):
+        with self._lock:
+            if self.state != State.FADING_OUT:
+                return
+            self.state = State.CANCELING
+        cfg = dict(self.cfg)
+        self.overlay.root.after(0, lambda: self._gui_cancel_sleep(cfg))
+
+    def _gui_cancel_sleep(self, cfg: dict):
+        self.overlay._cancel_anim()
+        self.overlay._clear_text()
+        cur = self.overlay._alpha
+        dur = max(200, int(cfg.get("fade_out_ms", 1500) * cur))
+
+        def _done():
+            with self._lock:
+                self.state = State.IDLE
+            self._countdown_val = 0
+            self.overlay.root.event_generate("<<StateChanged>>", when="tail")
+
+        if cur <= 0.0:
+            self.overlay.hide_instant()
+            _done()
+        else:
+            self.overlay.fade_to(0.0, dur, cfg.get("fade_curve", "ease_in_out"), _done)
+        self.overlay.root.event_generate("<<StateChanged>>", when="tail")
+
+    def _gui_fade_to_sleep(self, cfg: dict):
+        with self._lock:
+            if self.state != State.FADING_OUT:
+                return
+        self.overlay.set_color(cfg.get("overlay_color", "#000000"))
+        self.overlay._clear_text()
+
+        def _on_black():
+            with self._lock:
+                if self.state != State.FADING_OUT:
+                    return
+                self.state               = State.SLEEPING
+                self._idle_tick_at_sleep = get_idle_tick()
+            self.overlay.root.after(100, send_monitor_off)
+            with self._stats_lock:
+                self.stats["total_sleeps"] += 1
+                self.stats["last_sleep"]    = datetime.datetime.now().isoformat()
+                save_stats(self.stats)
+            self.overlay.root.event_generate("<<StateChanged>>", when="tail")
+
+        self.overlay.fade_to(1.0, cfg.get("fade_out_ms", 1500),
+                              cfg.get("fade_curve", "ease_in_out"), _on_black)
+        self.overlay.root.event_generate("<<StateChanged>>", when="tail")
+
+    def _begin_wake(self):
+        with self._lock:
+            if self.state != State.SLEEPING:
+                return
+            self.state = State.WAKING
+        with self._stats_lock:
+            self.stats["total_off_seconds"] += time.time() - self._sleep_start
+            save_stats(self.stats)
+        cfg      = dict(self.cfg)
+        delay_ms = int(cfg["wake_delay_s"] * 1000)
+        self.overlay.root.after(0,
+            lambda: self.overlay.root.after(delay_ms, lambda: self._gui_fade_in(cfg)))
+        self.overlay.root.event_generate("<<StateChanged>>", when="tail")
+
+    def _gui_fade_in(self, cfg: dict):
+        with self._lock:
+            self.state = State.FADING_IN
+        if cfg.get("sound_enabled"):
+            play_tone(cfg["sound_wake_freq"], cfg["sound_duration_ms"])
+
+        def _done():
+            with self._lock:
+                self.state = State.IDLE
+            self.overlay.root.event_generate("<<StateChanged>>", when="tail")
+
+        self.overlay.fade_to(0.0, cfg.get("fade_in_ms", 1000),
+                              cfg.get("fade_curve", "ease_in_out"), _done)
+        self.overlay.root.event_generate("<<StateChanged>>", when="tail")
+
+    def force_sleep(self):
+        with self._lock:
+            if self.state not in (State.IDLE, State.PAUSED, State.AMBIENT,
+                                  State.COUNTDOWN, State.WAKING, State.FADING_IN):
+                return
+            was_ambient = (self.state == State.AMBIENT)
+            was_waking  = self.state in (State.WAKING, State.FADING_IN)
+            if was_ambient or was_waking:
+                self.state = State.IDLE
+
+        self.overlay.root.after(0, self.overlay._cancel_anim)
+        self.overlay.root.after(0, self.overlay.stop_ambient)
+
+        if not was_waking:
+            self._countdown_val = 0
+            self.overlay.root.after(0, self.overlay._clear_text)
+
+        if self.cfg.get("ambient_mode") and not was_ambient and not was_waking:
+            self._enter_ambient()
+        else:
+            self._go_to_sleep()
+
+    def force_wake(self):
+        with self._lock:
+            if self.state != State.SLEEPING:
+                return
+        self._begin_wake()
+
+    def update_config(self, cfg: dict):
+        with self._lock:
+            self.cfg = cfg
+
+
+class SystemTray:
+    def __init__(self, root: tk.Tk, controller: CinematicWake, cfg: dict, ui: "SettingsUI"):
+        self.root       = root
+        self.controller = controller
+        self.cfg        = cfg
+        self.ui         = ui
+
+        self.icon = pystray.Icon(
+            "CinematicWake",
+            self._make_icon(),
+            "CinematicWake",
+            menu=self._build_menu()
+        )
+        threading.Thread(target=self.icon.run, daemon=True).start()
+
+    def _make_icon(self) -> Image.Image:
+        img = Image.new('RGBA', (64, 64), color=(0, 0, 0, 0))
+        d   = ImageDraw.Draw(img)
+        d.ellipse([4, 4, 60, 60], fill=(0, 212, 200, 255))
+        d.polygon([(24, 16), (24, 48), (48, 32)], fill=(255, 255, 255, 255))
+        return img
+
+    def _build_menu(self):
+        def _route(func, *args):
+            return lambda _: self.root.after(0, lambda: func(*args))
+
+        curve_items = []
+        for txt, val in CURVES:
+            curve_items.append(
+                pystray.MenuItem(
+                    txt,
+                    _route(self._set_curve, val),
+                    radio=True,
+                    checked=lambda item, v=val: self.cfg.get("fade_curve", "ease_in_out") == v
+                )
+            )
+
+        return pystray.Menu(
+            pystray.MenuItem("⚡  Sleep Now", _route(self.controller.force_sleep), default=True),
+            pystray.MenuItem(
+                lambda item: "▶  Resume" if self.controller.state == State.PAUSED else "⏸  Pause",
+                _route(self.controller._hotkey_pause),
+                checked=lambda item: self.controller.state == State.PAUSED
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "🌙  Ambient Mode",
+                _route(self._toggle_ambient),
+                checked=lambda item: self.cfg.get("ambient_mode", False)
+            ),
+            pystray.MenuItem(
+                "🔊  Sounds",
+                _route(self._toggle_sound),
+                checked=lambda item: self.cfg.get("sound_enabled", False)
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("📈  Fade Curve", pystray.Menu(*curve_items)),
+            pystray.MenuItem("⚙  Open Settings", pystray.Menu(
+                pystray.MenuItem("⏱  Timing",     _route(self._show_window, 0)),
+                pystray.MenuItem("🎨  Appearance", _route(self._show_window, 1)),
+                pystray.MenuItem("🌙  Ambient",    _route(self._show_window, 2)),
+                pystray.MenuItem("📅  Schedule",   _route(self._show_window, 3)),
+                pystray.MenuItem("🔊  Sound",      _route(self._show_window, 4)),
+                pystray.MenuItem("⌨  Hotkeys",    _route(self._show_window, 5)),
+                pystray.MenuItem("⚙  System",     _route(self._show_window, 6)),
+            )),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("✕  Quit CinematicWake", _route(self._quit))
+        )
+
+    def _toggle_ambient(self):
+        new_val = not self.cfg.get("ambient_mode", False)
+        self.cfg["ambient_mode"] = new_val
+        save_config(self.cfg)
+        self.controller.update_config(self.cfg)
+        if hasattr(self.ui, "_ambient_var"):
+            self.ui._ambient_var.set(new_val)
+        if hasattr(self.ui, "_ambient_tog"):
+            self.ui._ambient_tog.redraw()
+
+    def _toggle_sound(self):
+        new_val = not self.cfg.get("sound_enabled", False)
+        self.cfg["sound_enabled"] = new_val
+        save_config(self.cfg)
+        self.controller.update_config(self.cfg)
+        if hasattr(self.ui, "_snd_var"):
+            self.ui._snd_var.set(new_val)
+        if hasattr(self.ui, "_snd_tog"):
+            self.ui._snd_tog.redraw()
+
+    def _set_curve(self, val):
+        self.cfg["fade_curve"] = val
+        save_config(self.cfg)
+        self.controller.update_config(self.cfg)
+        if hasattr(self.ui, "_curve_var"):
+            self.ui._curve_var.set(val)
+
+    def _show_window(self, tab_idx: int = 0):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+        if hasattr(self.ui, "_notebook"):
+            self.ui._notebook.select(tab_idx)
+
+    def _quit(self):
+        self.icon.stop()
+        save_config(self.cfg)
+        self.root.destroy()
+        sys.exit(0)
+
+    def update_tooltip(self, text: str):
+        self.icon.title = text[:127]
+
+
+C_BG     = "#0F0F13"
+C_PANEL  = "#17171E"
+C_CARD   = "#1E1E28"
+C_BORDER = "#2A2A38"
+C_ACCENT = "#00D4C8"
+C_ACC2   = "#F5A623"
+C_FG     = "#E8E8F0"
+C_FG2    = "#7A7A9A"
+C_GREEN  = "#3DDC84"
+C_RED    = "#FF5370"
+C_ORANGE = "#FFB454"
+C_PURPLE = "#C792EA"
+
+FONT_TITLE  = ("Consolas", 18, "bold")
+FONT_LABEL  = ("Consolas", 10, "bold")
+FONT_SMALL  = ("Consolas",  9)
+FONT_MONO   = ("Consolas",  9)
+FONT_MEDIUM = ("Consolas", 13, "bold")
+
+
+def card_frame(parent, **kw):
+    return tk.Frame(parent, bg=C_CARD, **kw)
+
+
+def label(parent, text, font=None, fg=None, **kw):
+    return tk.Label(parent, text=text, font=font or FONT_SMALL,
+                    fg=fg or C_FG, bg=parent.cget("bg"), **kw)
+
+
+def sep(parent):
+    tk.Frame(parent, bg=C_BORDER, height=1).pack(fill="x", pady=8)
+
+
+class CWSlider:
+    def __init__(self, parent, title, subtitle, variable,
+                 from_, to_, resolution=1, fmt=None, command=None):
+        self.var     = variable
+        self.fmt     = fmt
+        self.command = command
+        outer = card_frame(parent, padx=16, pady=12)
+        outer.pack(fill="x", pady=5)
+        top = tk.Frame(outer, bg=C_CARD)
+        top.pack(fill="x")
+        label(top, title, font=FONT_LABEL, fg=C_FG).pack(side="left")
+        self._vl = tk.Label(top, font=FONT_LABEL, fg=C_ACCENT, bg=C_CARD)
+        self._vl.pack(side="right")
+        label(outer, subtitle, font=FONT_SMALL, fg=C_FG2).pack(anchor="w", pady=(2, 4))
+        tk.Scale(outer, variable=variable, from_=from_, to=to_,
+                 orient="horizontal", resolution=resolution,
+                 bg=C_CARD, fg=C_FG, troughcolor=C_BG,
+                 activebackground=C_ACCENT, highlightthickness=0,
+                 sliderlength=18, showvalue=False,
+                 command=self._on_change).pack(fill="x")
+        self._refresh_label()
+
+    def _refresh_label(self):
+        v = self.var.get()
+        self._vl.config(text=(self.fmt(v) if self.fmt else str(v)))
+
+    def _on_change(self, _):
+        self._refresh_label()
+        if self.command:
+            self.command()
+
+
+class CWToggle:
+    def __init__(self, parent, variable: tk.BooleanVar, command=None):
+        self.var     = variable
+        self.command = command
+        self.canvas  = tk.Canvas(parent, width=44, height=24,
+                                 bg=parent.cget("bg"), highlightthickness=0,
+                                 cursor="hand2")
+        self.canvas.bind("<Button-1>", self._toggle)
+        self._draw()
+
+    def pack(self, **kw):
+        self.canvas.pack(**kw)
+
+    def _toggle(self, _=None):
+        self.var.set(not self.var.get())
+        self._draw()
+        if self.command:
+            self.command()
+
+    def redraw(self):
+        self._draw()
+
+    def _draw(self):
+        self.canvas.delete("all")
+        on = self.var.get()
+        self._rr(2, 4, 42, 20, 8, fill=C_ACCENT if on else C_BORDER)
+        x = 30 if on else 14
+        self.canvas.create_oval(x - 8, 4, x + 8, 20, fill=C_FG, outline="")
+
+    def _rr(self, x1, y1, x2, y2, r, **kw):
+        for (sa, ex) in [(90, 90), (0, 90), (180, 90), (270, 90)]:
+            ax = x1 if sa in (90, 180) else x2 - 2 * r
+            ay = y1 if sa in (0, 90)  else y2 - 2 * r
+            self.canvas.create_arc(ax, ay, ax + 2 * r, ay + 2 * r,
+                                   start=sa, extent=ex, style="pieslice",
+                                   outline="", **kw)
+        self.canvas.create_rectangle(x1 + r, y1, x2 - r, y2, outline="", **kw)
+        self.canvas.create_rectangle(x1, y1 + r, x2, y2 - r, outline="", **kw)
+
+
+def toggle_row(parent, text, subtitle, var, cmd=None):
+    row  = tk.Frame(parent, bg=C_CARD)
+    row.pack(fill="x", padx=16, pady=6)
+    left = tk.Frame(row, bg=C_CARD)
+    left.pack(side="left", fill="x", expand=True)
+    label(left, text,     font=FONT_LABEL, fg=C_FG).pack(anchor="w")
+    label(left, subtitle, font=FONT_SMALL, fg=C_FG2).pack(anchor="w")
+    tog = CWToggle(row, var, command=cmd)
+    tog.pack(side="right", padx=(8, 0))
+    return tog
+
+
+class SettingsUI:
+    def __init__(self, root: tk.Tk, controller: CinematicWake, cfg: dict):
+        self.root       = root
+        self.controller = controller
+        self.cfg        = cfg
+        self._tray: "SystemTray | None" = None
+
+        root.title("CinematicWake")
+        root.configure(bg=C_BG)
+        root.resizable(False, False)
+        root.protocol("WM_DELETE_WINDOW", self._to_tray)
+
+        s = ttk.Style()
+        s.theme_use("default")
+        s.configure("TNotebook",      background=C_BG,    borderwidth=0)
+        s.configure("TNotebook.Tab", background=C_PANEL, foreground=C_FG2,
+                    font=FONT_SMALL, padding=[14, 8], borderwidth=0)
+        s.map("TNotebook.Tab",
+              background=[("selected", C_CARD)],
+              foreground=[("selected", C_ACCENT)])
+
+        hdr = tk.Frame(root, bg=C_PANEL, height=70)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        self._dot_canvas = tk.Canvas(hdr, width=12, height=12,
+                                     bg=C_PANEL, highlightthickness=0)
+        self._dot_canvas.pack(side="left", padx=(20, 8), pady=28)
+        self._dot_oval = self._dot_canvas.create_oval(0, 0, 11, 11, fill=C_GREEN, outline="")
+        tk.Label(hdr, text="CINEMATIC WAKE", font=FONT_TITLE,
+                 fg=C_FG, bg=C_PANEL).pack(side="left", pady=20)
+        tk.Label(hdr, text="v3.0", font=FONT_SMALL,
+                 fg=C_FG2, bg=C_PANEL).pack(side="left", padx=6, pady=28)
+        self._status_lbl = tk.Label(hdr, text="", font=FONT_SMALL,
+                                    fg=C_FG2, bg=C_PANEL)
+        self._status_lbl.pack(side="right", padx=20)
+        self._pause_btn = tk.Button(hdr, text="⏸  PAUSE",
+                                    font=FONT_SMALL, bg=C_CARD, fg=C_FG2,
+                                    relief="flat", padx=10, pady=4, cursor="hand2",
+                                    command=self._toggle_pause)
+        self._pause_btn.pack(side="right", padx=8, pady=18)
+
+        tk.Frame(root, bg=C_BORDER, height=1).pack(fill="x")
+        sbar = tk.Frame(root, bg=C_PANEL, pady=6)
+        sbar.pack(fill="x")
+        self._stat_sleeps = self._stat_col(sbar, "SLEEPS",     "0")
+        tk.Frame(sbar, bg=C_BORDER, width=1).pack(side="left", fill="y", padx=12)
+        self._stat_time   = self._stat_col(sbar, "TIME OFF",   "0h 0m")
+        tk.Frame(sbar, bg=C_BORDER, width=1).pack(side="left", fill="y", padx=12)
+        self._stat_last   = self._stat_col(sbar, "LAST SLEEP", "—")
+        tk.Button(sbar, text="SLEEP NOW", font=FONT_SMALL,
+                  bg=C_ACCENT, fg=C_BG, relief="flat", padx=12, pady=3, cursor="hand2",
+                  command=lambda: root.after(50, controller.force_sleep)
+                  ).pack(side="right", padx=16)
+
+        self._notebook = ttk.Notebook(root)
+        self._notebook.pack(fill="both", expand=True)
+
+        tabs = [
+            ("tab_timing",   " ⏱  Timing  "),
+            ("tab_appear",   " 🎨  Appear  "),
+            ("tab_ambient",  " 🌙  Ambient "),
+            ("tab_schedule", " 📅  Schedule"),
+            ("tab_sound",    " 🔊  Sound  "),
+            ("tab_hotkeys",  " ⌨  Hotkeys "),
+            ("tab_system",   " ⚙  System  "),
+        ]
+        self._tab_frames = {}
+        for attr, text in tabs:
+            f = tk.Frame(self._notebook, bg=C_PANEL)
+            self._notebook.add(f, text=text)
+            self._tab_frames[attr] = f
+
+        self._build_timing(   self._tab_frames["tab_timing"])
+        self._build_appearance(self._tab_frames["tab_appear"])
+        self._build_ambient(  self._tab_frames["tab_ambient"])
+        self._build_schedule( self._tab_frames["tab_schedule"])
+        self._build_sound(    self._tab_frames["tab_sound"])
+        self._build_hotkeys(  self._tab_frames["tab_hotkeys"])
+        self._build_system(   self._tab_frames["tab_system"])
+
+        foot = tk.Frame(root, bg=C_BG, pady=8)
+        foot.pack(fill="x", padx=20)
+        label(foot, "Win+Shift+L  →  sleep    Win+Shift+P  →  pause    ×  →  tray",
+              font=FONT_MONO, fg=C_FG2).pack(side="left")
+        tk.Button(foot, text="→ Tray", font=FONT_SMALL,
+                  bg=C_CARD, fg=C_FG2, relief="flat", padx=10, pady=3, cursor="hand2",
+                  command=self._to_tray).pack(side="right")
+
+        root.bind("<<StateChanged>>", lambda e: self._refresh())
+        root.bind("<<PauseChanged>>", lambda e: self._refresh())
+
+        self._update_stats()
+        self._refresh()
+        self._animate_dot()
+
+    def _build_timing(self, parent):
+        s = self._scrollable(parent)
+        label(s, "TIMING CONTROLS", font=FONT_LABEL, fg=C_ACCENT).pack(anchor="w", padx=16, pady=(12, 4))
+        sep(s)
+        self._idle_var = tk.IntVar(value=self.cfg["idle_minutes"])
+        self._fo_var   = tk.IntVar(value=self.cfg["fade_out_ms"] // 100)
+        self._fi_var   = tk.IntVar(value=self.cfg["fade_in_ms"]  // 100)
+        self._wd_var   = tk.DoubleVar(value=self.cfg["wake_delay_s"])
+        CWSlider(s, "Idle timeout", "Minutes of inactivity before sleeping",
+                 self._idle_var, 1, 120, fmt=lambda v: f"{v} min", command=self._save)
+        CWSlider(s, "Fade-to-sleep speed", "Duration of the fade-to-black animation",
+                 self._fo_var, 1, 50, fmt=lambda v: f"{v/10:.1f} s", command=self._save)
+        CWSlider(s, "Fade-from-sleep speed", "Duration of the desktop reveal animation",
+                 self._fi_var, 1, 50, fmt=lambda v: f"{v/10:.1f} s", command=self._save)
+        CWSlider(s, "Monitor wake delay", "Hold black while monitor powers on",
+                 self._wd_var, 0.0, 12.0, resolution=0.5,
+                 fmt=lambda v: f"{v:.1f} s", command=self._save)
+        sep(s)
+        label(s, "SMART IDLE", font=FONT_LABEL, fg=C_ACCENT).pack(anchor="w", padx=16, pady=(0, 4))
+        self._media_var = tk.BooleanVar(value=self.cfg.get("prevent_sleep_media", True))
+        mc = card_frame(s)
+        mc.pack(fill="x", pady=5)
+        toggle_row(mc, "Prevent sleep during media playback",
+                   "Halts the sleep timer if a video or game requests the display",
+                   self._media_var, cmd=self._save)
+        sep(s)
+        label(s, "FADE CURVE", font=FONT_LABEL, fg=C_ACCENT).pack(anchor="w", padx=16, pady=(0, 6))
+        self._curve_var = tk.StringVar(value=self.cfg["fade_curve"])
+        ccard = card_frame(s, padx=16, pady=10)
+        ccard.pack(fill="x", pady=5)
+        for txt, val in CURVES:
+            tk.Radiobutton(ccard, text=txt, variable=self._curve_var, value=val,
+                           font=FONT_SMALL, fg=C_FG, bg=C_CARD, selectcolor=C_BG,
+                           activeforeground=C_ACCENT, activebackground=C_CARD,
+                           command=self._save).pack(side="left", padx=8)
+        sep(s)
+        label(s, "COUNTDOWN", font=FONT_LABEL, fg=C_ACCENT).pack(anchor="w", padx=16, pady=(0, 4))
+        self._countdown_var = tk.BooleanVar(value=self.cfg.get("show_countdown", True))
+        self._cd_sec_var    = tk.IntVar(value=self.cfg.get("countdown_seconds", 5))
+        cd = card_frame(s)
+        cd.pack(fill="x", pady=5)
+        toggle_row(cd, "Show sleep countdown",
+                   "Display a countdown number on the overlay before sleeping",
+                   self._countdown_var, cmd=self._save)
+        CWSlider(s, "Countdown duration", "Seconds before sleep to start the countdown",
+                 self._cd_sec_var, 1, 30, fmt=lambda v: f"{v} s", command=self._save)
+
+    def _build_appearance(self, parent):
+        s = self._scrollable(parent)
+        label(s, "OVERLAY APPEARANCE", font=FONT_LABEL, fg=C_ACCENT).pack(anchor="w", padx=16, pady=(12, 4))
+        sep(s)
+        label(s, "COLOR THEME", font=FONT_LABEL, fg=C_ACCENT).pack(anchor="w", padx=16, pady=(0, 6))
+        self._theme_var = tk.StringVar(value=self.cfg.get("overlay_theme", "black"))
+        tc = card_frame(s, padx=16, pady=12)
+        tc.pack(fill="x", pady=5)
+        for txt, val in [("⬛ Void Black", "black"), ("🔴 Night Red", "red"),
+                          ("🔵 Deep Blue", "blue"),  ("🟢 Forest",    "green"),
+                          ("🎨 Custom…",   "custom")]:
+            tk.Radiobutton(tc, text=txt, variable=self._theme_var, value=val,
+                           font=FONT_SMALL, fg=C_FG, bg=C_CARD, selectcolor=C_BG,
+                           activeforeground=C_ACCENT, activebackground=C_CARD,
+                           command=self._on_theme_change).pack(anchor="w", pady=2)
+        self._color_var = tk.StringVar(value=self.cfg.get("overlay_color", "#000000"))
+        cr = tk.Frame(tc, bg=C_CARD)
+        cr.pack(anchor="w", pady=4)
+        label(cr, "Custom colour:", font=FONT_SMALL, fg=C_FG2).pack(side="left")
+        self._swatch = tk.Label(cr, width=4, bg=self._color_var.get(),
+                                relief="flat", cursor="hand2")
+        self._swatch.pack(side="left", padx=8)
+        self._swatch.bind("<Button-1>", self._pick_color)
+        self._color_lbl = label(cr, self._color_var.get(), fg=C_FG2)
+        self._color_lbl.pack(side="left")
+
+    def _build_ambient(self, parent):
+        s = self._scrollable(parent)
+        label(s, "AMBIENT MODE", font=FONT_LABEL, fg=C_ACCENT).pack(anchor="w", padx=16, pady=(12, 4))
+        label(s, "Pulse the overlay softly instead of cutting to full black.",
+              font=FONT_SMALL, fg=C_FG2).pack(anchor="w", padx=16)
+        sep(s)
+
+        self._ambient_var = tk.BooleanVar(value=self.cfg.get("ambient_mode", False))
+        self._amb_min_var = tk.DoubleVar(value=self.cfg.get("ambient_min_alpha", 0.85))
+        self._amb_spd_var = tk.DoubleVar(value=self.cfg.get("ambient_speed_s", 8.0))
+        ac = card_frame(s)
+        ac.pack(fill="x", pady=5)
+        self._ambient_tog = toggle_row(ac, "Enable ambient mode",
+                   "Overlay pulses gently — monitor signal NOT cut (OLED: use carefully)",
+                   self._ambient_var, cmd=self._save)
+        CWSlider(s, "Minimum opacity", "Darkest point of the pulse cycle",
+                 self._amb_min_var, 0.1, 0.95, resolution=0.05,
+                 fmt=lambda v: f"{int(v*100)}%", command=self._save)
+        CWSlider(s, "Pulse speed", "Duration of one full pulse cycle",
+                 self._amb_spd_var, 1.0, 30.0, resolution=0.5,
+                 fmt=lambda v: f"{v:.1f} s", command=self._save)
+
+        sep(s)
+        label(s, "AMBIENT SCHEDULE WINDOW", font=FONT_LABEL, fg=C_ACCENT).pack(anchor="w", padx=16, pady=(0, 4))
+        label(s, "Automatically activate ambient mode during a time window.",
+              font=FONT_SMALL, fg=C_FG2).pack(anchor="w", padx=16)
+
+        self._amb_sched_var   = tk.BooleanVar(value=self.cfg.get("ambient_schedule_enabled", False))
+        self._amb_sched_start = tk.StringVar(value=self.cfg.get("ambient_schedule_start", "22:00"))
+        self._amb_sched_end   = tk.StringVar(value=self.cfg.get("ambient_schedule_end",   "07:00"))
+
+        asc = card_frame(s)
+        asc.pack(fill="x", pady=5)
+        toggle_row(asc, "Enable ambient schedule",
+                   "Ambient activates/deactivates automatically by clock",
+                   self._amb_sched_var, cmd=self._save)
+
+        tw = card_frame(s, padx=16, pady=12)
+        tw.pack(fill="x", pady=5)
+        for txt, var, side in [("Start (HH:MM)", self._amb_sched_start, "left"),
+                                ("End   (HH:MM)", self._amb_sched_end,   "right")]:
+            col = tk.Frame(tw, bg=C_CARD)
+            col.pack(side=side, expand=True, fill="x", padx=8)
+            label(col, txt, font=FONT_LABEL, fg=C_FG2).pack(anchor="w")
+            ent = tk.Entry(col, textvariable=var, font=FONT_MEDIUM,
+                           bg=C_BG, fg=C_ACCENT, insertbackground=C_ACCENT,
+                           relief="flat", width=7)
+            ent.pack(anchor="w", pady=4)
+            ent.bind("<FocusOut>", lambda e: self._save())
+
+        label(s, "ℹ  Start > End wraps midnight (e.g. 22:00–07:00 = overnight).",
+              font=FONT_SMALL, fg=C_FG2).pack(anchor="w", padx=16, pady=(0, 8))
+
+        sep(s)
+        label(s, "AMBIENT IDLE ESCALATION", font=FONT_LABEL, fg=C_ACCENT).pack(anchor="w", padx=16, pady=(0, 4))
+        label(s, "Go ambient after N minutes idle, then escalate after M more minutes.",
+              font=FONT_SMALL, fg=C_FG2).pack(anchor="w", padx=16)
+
+        self._amb_idle_var   = tk.BooleanVar(value=self.cfg.get("ambient_idle_enabled", False))
+        self._amb_idle_min   = tk.IntVar(value=self.cfg.get("ambient_idle_minutes", 2))
+        self._amb_esc_min    = tk.IntVar(value=self.cfg.get("ambient_escalate_minutes", 10))
+        self._amb_esc_action = tk.StringVar(value=self.cfg.get("ambient_escalate_action", "sleep"))
+
+        aic = card_frame(s)
+        aic.pack(fill="x", pady=5)
+        toggle_row(aic, "Enable idle escalation",
+                   "Idle → Ambient → Full Sleep (or wake) automatically",
+                   self._amb_idle_var, cmd=self._save)
+        CWSlider(s, "Go ambient after", "Minutes of idle before ambient activates",
+                 self._amb_idle_min, 1, 60, fmt=lambda v: f"{v} min", command=self._save)
+        CWSlider(s, "Escalate after", "Additional minutes in ambient before escalating",
+                 self._amb_esc_min, 1, 120, fmt=lambda v: f"{v} min", command=self._save)
+
+        label(s, "Escalation action", font=FONT_LABEL, fg=C_ACCENT).pack(anchor="w", padx=16, pady=(8, 2))
+        label(s, "What happens when ambient time runs out.",
+              font=FONT_SMALL, fg=C_FG2).pack(anchor="w", padx=16)
+        aact = card_frame(s, padx=16, pady=10)
+        aact.pack(fill="x", pady=5)
+        for txt, val in [("Full Sleep (cut signal)", "sleep"),
+                          ("Fade back to desktop",   "wake")]:
+            tk.Radiobutton(aact, text=txt, variable=self._amb_esc_action, value=val,
+                           font=FONT_SMALL, fg=C_FG, bg=C_CARD, selectcolor=C_BG,
+                           activeforeground=C_ACCENT, activebackground=C_CARD,
+                           command=self._save).pack(anchor="w", pady=2)
+
+    def _build_schedule(self, parent):
+        s = self._scrollable(parent)
+        label(s, "SLEEP ACTIVE HOURS", font=FONT_LABEL, fg=C_ACCENT).pack(anchor="w", padx=16, pady=(12, 4))
+        label(s, "Auto-sleep only runs within this window.", font=FONT_SMALL, fg=C_FG2).pack(anchor="w", padx=16)
+        sep(s)
+        self._sched_var   = tk.BooleanVar(value=self.cfg.get("schedule_enabled", False))
+        self._sched_start = tk.StringVar(value=self.cfg.get("schedule_start", "08:00"))
+        self._sched_end   = tk.StringVar(value=self.cfg.get("schedule_end",   "23:00"))
+        sc = card_frame(s)
+        sc.pack(fill="x", pady=5)
+        toggle_row(sc, "Enable sleep schedule",
+                   "Suppress auto-sleep outside the window you set.",
+                   self._sched_var, cmd=self._save)
+        tw = card_frame(s, padx=16, pady=12)
+        tw.pack(fill="x", pady=5)
+        for txt, var, side in [("Start (HH:MM)", self._sched_start, "left"),
+                                ("End   (HH:MM)", self._sched_end,   "right")]:
+            col = tk.Frame(tw, bg=C_CARD)
+            col.pack(side=side, expand=True, fill="x", padx=8)
+            label(col, txt, font=FONT_LABEL, fg=C_FG2).pack(anchor="w")
+            ent = tk.Entry(col, textvariable=var, font=FONT_MEDIUM,
+                           bg=C_BG, fg=C_ACCENT, insertbackground=C_ACCENT,
+                           relief="flat", width=7)
+            ent.pack(anchor="w", pady=4)
+            ent.bind("<FocusOut>", lambda e: self._save())
+        label(s, "ℹ  Start > End wraps midnight.",
+              font=FONT_SMALL, fg=C_FG2).pack(anchor="w", padx=16, pady=8)
+
+    def _build_sound(self, parent):
+        s = self._scrollable(parent)
+        label(s, "SOUND SETTINGS", font=FONT_LABEL, fg=C_ACCENT).pack(anchor="w", padx=16, pady=(12, 4))
+        label(s, "Tones generated in real-time — no audio files needed.",
+              font=FONT_SMALL, fg=C_FG2).pack(anchor="w", padx=16)
+        sep(s)
+        self._snd_var     = tk.BooleanVar(value=self.cfg.get("sound_enabled",   False))
+        self._snd_sf_var  = tk.IntVar(value=self.cfg.get("sound_sleep_freq",  300))
+        self._snd_wf_var  = tk.IntVar(value=self.cfg.get("sound_wake_freq",   600))
+        self._snd_dur_var = tk.IntVar(value=self.cfg.get("sound_duration_ms", 400) // 10)
+        sc = card_frame(s)
+        sc.pack(fill="x", pady=5)
+        self._snd_tog = toggle_row(sc, "Enable sounds", "Soft chime on sleep and wake", self._snd_var, cmd=self._save)
+        CWSlider(s, "Sleep tone", "Frequency (Hz) — lower = deeper",
+                 self._snd_sf_var, 80, 1200, fmt=lambda v: f"{v} Hz", command=self._save)
+        CWSlider(s, "Wake tone", "Frequency (Hz) — higher = brighter",
+                 self._snd_wf_var, 80, 1200, fmt=lambda v: f"{v} Hz", command=self._save)
+        CWSlider(s, "Duration", "Tone length",
+                 self._snd_dur_var, 1, 100, fmt=lambda v: f"{v*10} ms", command=self._save)
+        sep(s)
+        br = tk.Frame(s, bg=C_PANEL)
+        br.pack(padx=16, pady=4)
+        tk.Button(br, text="▶  Test Sleep Tone", font=FONT_SMALL,
+                  bg=C_CARD, fg=C_ACCENT, relief="flat", padx=12, pady=5, cursor="hand2",
+                  command=lambda: play_tone(self._snd_sf_var.get(), self._snd_dur_var.get() * 10)
+                  ).pack(side="left", padx=4)
+        tk.Button(br, text="▶  Test Wake Tone", font=FONT_SMALL,
+                  bg=C_CARD, fg=C_ACC2, relief="flat", padx=12, pady=5, cursor="hand2",
+                  command=lambda: play_tone(self._snd_wf_var.get(), self._snd_dur_var.get() * 10)
+                  ).pack(side="left", padx=4)
+
+    def _build_hotkeys(self, parent):
+        s = self._scrollable(parent)
+        label(s, "GLOBAL HOTKEYS", font=FONT_LABEL, fg=C_ACCENT).pack(anchor="w", padx=16, pady=(12, 4))
+        label(s, "Active system-wide even when the window is minimised to tray.",
+              font=FONT_SMALL, fg=C_FG2).pack(anchor="w", padx=16)
+        sep(s)
+        for name, combo, desc in [
+            ("Instant Sleep",  "Win + Shift + L", "Immediately fade to sleep"),
+            ("Pause / Resume", "Win + Shift + P", "Suspend auto-sleep timer"),
+        ]:
+            hc = card_frame(s, padx=16, pady=12)
+            hc.pack(fill="x", pady=5)
+            row = tk.Frame(hc, bg=C_CARD)
+            row.pack(fill="x")
+            label(row, name, font=FONT_LABEL, fg=C_FG).pack(side="left")
+            tk.Label(row, text=combo, font=("Consolas", 10, "bold"),
+                     fg=C_BG, bg=C_ACCENT, padx=6, pady=2).pack(side="right")
+            label(hc, desc, font=FONT_SMALL, fg=C_FG2).pack(anchor="w", pady=(4, 0))
+
+    def _build_system(self, parent):
+        s = self._scrollable(parent)
+        label(s, "SYSTEM SETTINGS", font=FONT_LABEL, fg=C_ACCENT).pack(anchor="w", padx=16, pady=(12, 4))
+        sep(s)
+        self._autostart_var  = tk.BooleanVar(value=get_autostart())
+        self._tray_start_var = tk.BooleanVar(value=self.cfg.get("start_in_tray", True))
+        sc = card_frame(s)
+        sc.pack(fill="x", pady=5)
+        toggle_row(sc, "Launch at Windows startup",
+                   "Add to the registry Run key.",
+                   self._autostart_var,
+                   cmd=lambda: set_autostart(self._autostart_var.get()))
+        tc = card_frame(s)
+        tc.pack(fill="x", pady=5)
+        toggle_row(tc, "Start minimised to tray",
+                   "Hide the settings window on launch — icon appears in tray.",
+                   self._tray_start_var, cmd=self._save)
+        sep(s)
+        label(s, "DIAGNOSTICS", font=FONT_LABEL, fg=C_ACCENT).pack(anchor="w", padx=16, pady=(0, 6))
+        dc = card_frame(s, padx=16, pady=12)
+        dc.pack(fill="x", pady=5)
+        self._diag_lbl = label(dc, self._diag_text(), font=FONT_MONO, fg=C_FG2, justify="left")
+        self._diag_lbl.pack(anchor="w")
+        tk.Button(dc, text="↺  Refresh", font=FONT_SMALL, bg=C_BG, fg=C_FG2,
+                  relief="flat", padx=8, pady=3, cursor="hand2",
+                  command=lambda: self._diag_lbl.config(text=self._diag_text())
+                  ).pack(anchor="w", pady=(8, 0))
+        sep(s)
+        label(s, "RESET", font=FONT_LABEL, fg=C_RED).pack(anchor="w", padx=16, pady=(0, 4))
+        rc = card_frame(s, padx=16, pady=10)
+        rc.pack(fill="x", pady=5)
+        tk.Button(rc, text="Reset stats to zero", font=FONT_SMALL,
+                  bg=C_RED, fg=C_BG, relief="flat", padx=10, pady=4, cursor="hand2",
+                  command=self._reset_stats).pack(anchor="w")
+        label(rc, "Wipes the sleep counter and total screen-off time.",
+              font=FONT_SMALL, fg=C_FG2).pack(anchor="w", pady=(4, 0))
+
+    def _scrollable(self, parent) -> tk.Frame:
+        canvas = tk.Canvas(parent, bg=C_PANEL, highlightthickness=0)
+        sb     = tk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        inner  = tk.Frame(canvas, bg=C_PANEL)
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        def _on_enter(e):
+            canvas.bind_all("<MouseWheel>",
+                            lambda ev: canvas.yview_scroll(-1 * (ev.delta // 120), "units"))
+
+        def _on_leave(e):
+            canvas.unbind_all("<MouseWheel>")
+
+        canvas.bind("<Enter>", _on_enter)
+        canvas.bind("<Leave>", _on_leave)
+        inner.bind("<Enter>", _on_enter)
+        inner.bind("<Leave>", _on_leave)
+        return inner
+
+    def _stat_col(self, parent, title, value):
+        col = tk.Frame(parent, bg=C_PANEL)
+        col.pack(side="left", padx=16)
+        label(col, title, font=FONT_SMALL, fg=C_FG2).pack()
+        v = tk.Label(col, text=value, font=("Consolas", 14, "bold"), fg=C_ACCENT, bg=C_PANEL)
+        v.pack()
+        return v
+
+    def _on_theme_change(self):
+        t = self._theme_var.get()
+        if t in THEME_COLORS:
+            self._color_var.set(THEME_COLORS[t])
+            self._swatch.config(bg=THEME_COLORS[t])
+            self._color_lbl.config(text=THEME_COLORS[t])
+        elif t == "custom":
+            self._pick_color()
+        self._save()
+
+    def _pick_color(self, _=None):
+        c = colorchooser.askcolor(color=self._color_var.get(), title="Choose overlay colour")
+        if c and c[1]:
+            self._color_var.set(c[1])
+            self._swatch.config(bg=c[1])
+            self._color_lbl.config(text=c[1])
+            self._theme_var.set("custom")
+            self._save()
+
+    def _save(self, *_):
+        def _g(attr, default=None):
+            try:
+                return getattr(self, attr).get()
+            except AttributeError:
+                return default
+
+        self.cfg["idle_minutes"] = _g("_idle_var", self.cfg.get("idle_minutes", 5))
+
+        mv = _g("_media_var")
+        if mv is not None:
+            self.cfg["prevent_sleep_media"] = mv
+
+        fo = _g("_fo_var")
+        fi = _g("_fi_var")
+        wd = _g("_wd_var")
+        cv = _g("_curve_var")
+        sc = _g("_countdown_var")
+        cd = _g("_cd_sec_var")
+
+        self.cfg["fade_out_ms"]  = fo * 100        if fo is not None else self.cfg.get("fade_out_ms",  1500)
+        self.cfg["fade_in_ms"]   = fi * 100        if fi is not None else self.cfg.get("fade_in_ms",   1000)
+        self.cfg["wake_delay_s"] = wd              if wd is not None else self.cfg.get("wake_delay_s", 3.0)
+        self.cfg["fade_curve"]   = cv              if cv is not None else self.cfg.get("fade_curve",   "ease_in_out")
+
+        if sc is not None: self.cfg["show_countdown"]    = sc
+        if cd is not None: self.cfg["countdown_seconds"] = cd
+
+        th = _g("_theme_var")
+        co = _g("_color_var")
+        if th is not None: self.cfg["overlay_theme"] = th
+        if co is not None:
+            self.cfg["overlay_color"] = co
+            self.controller.overlay.set_color(co)
+
+        am = _g("_ambient_var")
+        mn = _g("_amb_min_var")
+        sp = _g("_amb_spd_var")
+        if am is not None: self.cfg["ambient_mode"]      = am
+        if mn is not None: self.cfg["ambient_min_alpha"] = mn
+        if sp is not None: self.cfg["ambient_speed_s"]   = sp
+
+        asv = _g("_amb_sched_var")
+        ass = _g("_amb_sched_start")
+        ase = _g("_amb_sched_end")
+        if asv is not None: self.cfg["ambient_schedule_enabled"] = asv
+        if ass is not None: self.cfg["ambient_schedule_start"]   = ass
+        if ase is not None: self.cfg["ambient_schedule_end"]     = ase
+
+        aiv = _g("_amb_idle_var")
+        aim = _g("_amb_idle_min")
+        aem = _g("_amb_esc_min")
+        aea = _g("_amb_esc_action")
+        if aiv is not None: self.cfg["ambient_idle_enabled"]     = aiv
+        if aim is not None: self.cfg["ambient_idle_minutes"]     = aim
+        if aem is not None: self.cfg["ambient_escalate_minutes"] = aem
+        if aea is not None: self.cfg["ambient_escalate_action"]  = aea
+
+        se  = _g("_sched_var")
+        ss  = _g("_sched_start")
+        se2 = _g("_sched_end")
+        if se  is not None: self.cfg["schedule_enabled"] = se
+        if ss  is not None: self.cfg["schedule_start"]   = ss
+        if se2 is not None: self.cfg["schedule_end"]     = se2
+
+        sn = _g("_snd_var")
+        sf = _g("_snd_sf_var")
+        wf = _g("_snd_wf_var")
+        sd = _g("_snd_dur_var")
+        if sn is not None: self.cfg["sound_enabled"]     = sn
+        if sf is not None: self.cfg["sound_sleep_freq"]  = sf
+        if wf is not None: self.cfg["sound_wake_freq"]   = wf
+        if sd is not None: self.cfg["sound_duration_ms"] = sd * 10
+
+        ti = _g("_tray_start_var")
+        if ti is not None:
+            self.cfg["start_in_tray"] = ti
+
+        save_config(self.cfg)
+        self.controller.update_config(self.cfg)
+
+    def _toggle_pause(self):
+        self.controller._hotkey_pause()
+
+    def _to_tray(self):
+        self.root.withdraw()
+
+    def _refresh(self):
+        state  = self.controller.state
+        colors = {
+            State.IDLE:       (C_GREEN,  "ACTIVE"),
+            State.COUNTDOWN:  (C_ORANGE, "COUNTDOWN"),
+            State.FADING_OUT: (C_ORANGE, "FADING OUT"),
+            State.AMBIENT:    (C_PURPLE, "AMBIENT"),
+            State.CANCELING:  (C_PURPLE, "CANCELING"),
+            State.SLEEPING:   (C_FG2,    "SLEEPING"),
+            State.WAKING:     (C_ORANGE, "WAKING"),
+            State.FADING_IN:  (C_ORANGE, "FADING IN"),
+            State.PAUSED:     (C_RED,    "PAUSED"),
+        }
+        dot_col, txt = colors.get(state, (C_FG2, state.upper()))
+        self._dot_canvas.itemconfig(self._dot_oval, fill=dot_col)
+
+        if state == State.IDLE:
+            if self.controller.cfg.get("prevent_sleep_media", True) and self.controller._media_is_playing:
+                self._status_lbl.config(text="ACTIVE  •  Media Playing", fg=C_FG2)
+            else:
+                raw_idle = get_idle_seconds()
+                if self.controller.cfg.get("prevent_sleep_media", True):
+                    idle = min(raw_idle, time.time() - self.controller._last_media_active_time)
+                else:
+                    idle   = raw_idle
+                remain = max(0, self.cfg["idle_minutes"] * 60 - idle)
+                m, s   = divmod(int(remain), 60)
+                self._status_lbl.config(text=f"{txt}  •  sleeps in {m:02d}:{s:02d}", fg=C_FG2)
+        elif state == State.AMBIENT:
+            elapsed = int(time.time() - self.controller._ambient_start)
+            m, s    = divmod(elapsed, 60)
+            self._status_lbl.config(text=f"AMBIENT  •  {m:02d}:{s:02d}", fg=C_PURPLE)
+        else:
+            self._status_lbl.config(text=txt, fg=dot_col)
+
+        self._pause_btn.config(
+            text="▶  RESUME" if state == State.PAUSED else "⏸  PAUSE",
+            fg=C_ORANGE if state == State.PAUSED else C_FG2)
+
+        self._update_stats()
+
+        if self._tray:
+            self._tray.update_tooltip(f"CinematicWake — {txt}")
+
+    def _update_stats(self):
+        stats = self.controller.stats
+        self._stat_sleeps.config(text=str(stats.get("total_sleeps", 0)))
+        secs    = int(stats.get("total_off_seconds", 0))
+        h, rem  = divmod(secs, 3600)
+        self._stat_time.config(text=f"{h}h {rem//60}m")
+        last = stats.get("last_sleep")
+        if last:
+            try:
+                dt = datetime.datetime.fromisoformat(last)
+                self._stat_last.config(text=dt.strftime("%H:%M  %d %b"))
+            except Exception:
+                self._stat_last.config(text="—")
+
+    def _diag_text(self) -> str:
+        monitors      = get_monitor_rects()
+        media_playing = self.controller._media_is_playing
+        lines = [
+            f"Python:    {sys.version.split()[0]}",
+            f"Monitors:  {len(monitors)}  →  {monitors}",
+            f"Idle now:  {get_idle_seconds():.1f} s",
+            f"State:     {self.controller.state}",
+            f"Media Lock:{media_playing}",
+            f"Amb sched: {within_ambient_schedule(self.cfg)}",
+            f"Sleep sched:{within_schedule(self.cfg)}",
+            f"Autostart: {get_autostart()}",
+        ]
+        return "\n".join(lines)
+
+    def _reset_stats(self):
+        with self.controller._stats_lock:
+            self.controller.stats = {"total_sleeps": 0, "total_off_seconds": 0, "last_sleep": None}
+            save_stats(self.controller.stats)
+        self._update_stats()
+
+    def _animate_dot(self):
+        state = self.controller.state
+        if state in (State.FADING_OUT, State.FADING_IN, State.WAKING,
+                     State.COUNTDOWN, State.CANCELING):
+            col = C_ORANGE
+        elif state == State.AMBIENT:
+            t   = time.perf_counter() % 1.0
+            col = C_PURPLE if t < 0.5 else "#8060B0"
+        else:
+            col = {State.IDLE: C_GREEN, State.SLEEPING: C_FG2,
+                   State.PAUSED: C_RED}.get(state, C_FG2)
+        self._dot_canvas.itemconfig(self._dot_oval, fill=col)
+        self.root.after(500, self._animate_dot)
+        self._refresh()
+
+
+def main():
+    if sys.platform != "win32":
+        print("CinematicWake requires Windows.")
+        sys.exit(1)
+
+    cfg  = load_config()
+    root = tk.Tk()
+
+    overlay    = Overlay(root)
+    controller = CinematicWake(overlay, cfg)
+    ui         = SettingsUI(root, controller, cfg)
+
+    overlay.set_color(cfg.get("overlay_color", "#000000"))
+
+    tray   = SystemTray(root, controller, cfg, ui)
+    ui._tray = tray
+
+    controller.start()
+
+    if cfg.get("start_in_tray", True):
+        root.after(200, root.withdraw)
+
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
